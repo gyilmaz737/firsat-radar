@@ -150,5 +150,11 @@ def main():
 
     print(f"Geçmiş fiyatlar kaydedildi: {HISTORY_FILE}")
 
+import time
+
 if __name__ == "__main__":
-    main()
+    while True:
+        print("Kontrol çalışıyor...")
+        main()
+        print("30 dakika bekleniyor...")
+        time.sleep(1800)  # 30 dakika
