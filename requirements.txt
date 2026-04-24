@@ -1,4 +1,4 @@
-kpandas
+pandas
 selenium
 webdriver-manager
 requests
