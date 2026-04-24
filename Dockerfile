@@ -12,5 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "tracker.py"]
-
+CMD ["python", "-u", "tracker.py"]
