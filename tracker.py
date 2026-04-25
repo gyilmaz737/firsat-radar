@@ -1,4 +1,4 @@
-import os
+kimport os
 import re
 import json
 import time
@@ -13,19 +13,19 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 
 
-PRODUCTS_FILE = "products.csv"
-SEARCHES_FILE = "searches.csv"
-HISTORY_FILE = "price_history.csv"
-SEARCH_HISTORY_FILE = "search_history.csv"
-STATE_FILE = "telegram_state.json"
+DATA_DIR = "/data"
+
+PRODUCTS_FILE = f"{DATA_DIR}/products.csv"
+SEARCHES_FILE = f"{DATA_DIR}/searches.csv"
+HISTORY_FILE = f"{DATA_DIR}/price_history.csv"
+SEARCH_HISTORY_FILE = f"{DATA_DIR}/search_history.csv"
+STATE_FILE = f"{DATA_DIR}/telegram_state.json"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ASIN_CHECK_INTERVAL_SECONDS = 1800
 TELEGRAM_POLL_SECONDS = 3
-
-# Türkiye saatine göre günde 3 kez arama raporu
 SEARCH_REPORT_HOURS = [9, 14, 21]
 
 last_update_id = 0
@@ -38,6 +38,8 @@ def now_tr():
 
 
 def ensure_files():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
     if not os.path.exists(PRODUCTS_FILE):
         pd.DataFrame(columns=[
             "name", "url", "asin", "start_date", "end_date",
@@ -62,7 +64,6 @@ def tg_send(text, keyboard=None):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
 
     for chunk in chunks:
@@ -262,7 +263,11 @@ def search_amazon(driver, keyword, limit=10):
 
             title = ""
 
-            for selector in ["h2 span", ".a-size-base-plus.a-color-base.a-text-normal", ".a-size-medium.a-color-base.a-text-normal"]:
+            for selector in [
+                "h2 span",
+                ".a-size-base-plus.a-color-base.a-text-normal",
+                ".a-size-medium.a-color-base.a-text-normal"
+            ]:
                 try:
                     title = item.find_element(By.CSS_SELECTOR, selector).text.strip()
                     if title:
