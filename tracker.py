@@ -5,6 +5,7 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
 
 from selenium import webdriver
@@ -18,16 +19,22 @@ HISTORY_FILE = "price_history.csv"
 SEARCH_HISTORY_FILE = "search_history.csv"
 STATE_FILE = "telegram_state.json"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ASIN_CHECK_INTERVAL_SECONDS = 1800
 TELEGRAM_POLL_SECONDS = 3
+
+# Türkiye saatine göre günde 3 kez arama raporu
 SEARCH_REPORT_HOURS = [9, 14, 21]
 
 last_update_id = 0
 last_asin_check_time = 0
 last_search_report_key = ""
+
+
+def now_tr():
+    return datetime.now(ZoneInfo("Europe/Istanbul"))
 
 
 def ensure_files():
@@ -50,26 +57,36 @@ def ensure_files():
 def tg_send(text, keyboard=None):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram bilgileri eksik.", flush=True)
+        print(f"TELEGRAM_TOKEN var mı: {bool(TELEGRAM_TOKEN)}", flush=True)
+        print(f"TELEGRAM_CHAT_ID var mı: {bool(TELEGRAM_CHAT_ID)}", flush=True)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
 
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
 
-    try:
-        requests.post(url, data=data, timeout=15)
-    except Exception as e:
-        print(f"Telegram gönderim hatası: {e}", flush=True)
+    for chunk in chunks:
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+
+        if keyboard and chunk == chunks[-1]:
+            data["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
+
+        try:
+            r = requests.post(url, data=data, timeout=15)
+            print(f"Telegram cevap: {r.status_code} - {r.text}", flush=True)
+        except Exception as e:
+            print(f"Telegram gönderim hatası: {e}", flush=True)
 
 
 def tg_answer_callback(callback_id):
+    if not TELEGRAM_TOKEN:
+        return
+
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
         requests.post(url, data={"callback_query_id": callback_id}, timeout=10)
@@ -86,7 +103,7 @@ def main_menu():
             ],
             [
                 {"text": "❌ ASIN Ürün Sil", "callback_data": "delete_menu"},
-                {"text": "🔄 Şimdi Kontrol Et", "callback_data": "check_now"}
+                {"text": "🔄 ASIN Şimdi Kontrol Et", "callback_data": "check_now"}
             ],
             [
                 {"text": "🔎 Arama Takibi Ekle", "callback_data": "add_search"},
@@ -226,11 +243,81 @@ def get_price(driver, url):
     return title, price
 
 
+def search_amazon(driver, keyword, limit=10):
+    search_url = f"https://www.amazon.com.tr/s?k={quote_plus(keyword)}"
+    driver.get(search_url)
+    time.sleep(6)
+
+    results = []
+    items = driver.find_elements(By.CSS_SELECTOR, "div.s-result-item[data-asin]")
+
+    for item in items:
+        if len(results) >= limit:
+            break
+
+        try:
+            asin = item.get_attribute("data-asin")
+            if not asin or len(asin) != 10:
+                continue
+
+            title = ""
+
+            for selector in ["h2 span", ".a-size-base-plus.a-color-base.a-text-normal", ".a-size-medium.a-color-base.a-text-normal"]:
+                try:
+                    title = item.find_element(By.CSS_SELECTOR, selector).text.strip()
+                    if title:
+                        break
+                except Exception:
+                    pass
+
+            if not title:
+                continue
+
+            price_text = None
+
+            for selector in [".a-price .a-offscreen", "span.a-price-whole"]:
+                try:
+                    price_text = item.find_element(By.CSS_SELECTOR, selector).get_attribute("textContent").strip()
+                    if price_text:
+                        break
+                except Exception:
+                    pass
+
+            price_number = clean_price(price_text)
+
+            if price_number is None:
+                continue
+
+            bad_words = [
+                "kılıf", "kapak", "stand", "şarj istasyonu", "koruyucu",
+                "skin", "case", "thumb", "analog başlık", "sticker",
+                "etiket", "taşıma çantası"
+            ]
+
+            if any(word in title.lower() for word in bad_words):
+                continue
+
+            results.append({
+                "keyword": keyword,
+                "asin": asin,
+                "title": title,
+                "price_text": price_text,
+                "price": price_number,
+                "url": make_amazon_link(asin)
+            })
+
+        except Exception:
+            continue
+
+    results = sorted(results, key=lambda x: x["price"])
+    return results[:limit]
+
+
 def add_product_to_csv(name, url, asin, target_price, days):
     ensure_files()
     df = pd.read_csv(PRODUCTS_FILE)
 
-    start_date = datetime.now().date()
+    start_date = now_tr().date()
     end_date = start_date + timedelta(days=int(days))
 
     new_row = {
@@ -251,7 +338,7 @@ def add_search_to_csv(keyword, days):
     ensure_files()
     df = pd.read_csv(SEARCHES_FILE)
 
-    start_date = datetime.now().date()
+    start_date = now_tr().date()
     end_date = start_date + timedelta(days=int(days))
 
     new_row = {
@@ -313,12 +400,10 @@ def delete_keyboard():
     buttons = []
 
     for i, row in active_df.iterrows():
-        buttons.append([
-            {
-                "text": f"❌ {i + 1}. {row['name']}",
-                "callback_data": f"delete_{row['index']}"
-            }
-        ])
+        buttons.append([{
+            "text": f"❌ {i + 1}. {row['name']}",
+            "callback_data": f"delete_{row['index']}"
+        }])
 
     buttons.append([{"text": "⬅️ Ana Menü", "callback_data": "menu"}])
     return {"inline_keyboard": buttons}
@@ -332,12 +417,10 @@ def delete_search_keyboard():
     buttons = []
 
     for i, row in active_df.iterrows():
-        buttons.append([
-            {
-                "text": f"🗑 {i + 1}. {row['keyword']}",
-                "callback_data": f"delete_search_{row['index']}"
-            }
-        ])
+        buttons.append([{
+            "text": f"🗑 {i + 1}. {row['keyword']}",
+            "callback_data": f"delete_search_{row['index']}"
+        }])
 
     buttons.append([{"text": "⬅️ Ana Menü", "callback_data": "menu"}])
     return {"inline_keyboard": buttons}
@@ -353,91 +436,6 @@ def delete_search(index):
     df = pd.read_csv(SEARCHES_FILE)
     df.loc[int(index), "is_active"] = 0
     df.to_csv(SEARCHES_FILE, index=False)
-
-
-def search_amazon(driver, keyword, limit=10):
-    search_url = f"https://www.amazon.com.tr/s?k={quote_plus(keyword)}"
-    driver.get(search_url)
-    time.sleep(6)
-
-    results = []
-
-    items = driver.find_elements(By.CSS_SELECTOR, "div.s-result-item[data-asin]")
-
-    for item in items:
-        if len(results) >= limit:
-            break
-
-        try:
-            asin = item.get_attribute("data-asin")
-            if not asin or len(asin) != 10:
-                continue
-
-            title = ""
-
-            title_selectors = [
-                "h2 span",
-                ".a-size-base-plus.a-color-base.a-text-normal",
-                ".a-size-medium.a-color-base.a-text-normal"
-            ]
-
-            for selector in title_selectors:
-                try:
-                    title = item.find_element(By.CSS_SELECTOR, selector).text.strip()
-                    if title:
-                        break
-                except Exception:
-                    pass
-
-            if not title:
-                continue
-
-            price_text = None
-
-            price_selectors = [
-                ".a-price .a-offscreen",
-                "span.a-price-whole"
-            ]
-
-            for selector in price_selectors:
-                try:
-                    price_text = item.find_element(By.CSS_SELECTOR, selector).get_attribute("textContent").strip()
-                    if price_text:
-                        break
-                except Exception:
-                    pass
-
-            price_number = clean_price(price_text)
-
-            if price_number is None:
-                continue
-
-            link = make_amazon_link(asin)
-
-            title_lower = title.lower()
-
-            bad_words = [
-                "kılıf", "kapak", "stand", "şarj istasyonu", "koruyucu",
-                "skin", "case", "thumb", "analog başlık", "sticker"
-            ]
-
-            if any(word in title_lower for word in bad_words):
-                continue
-
-            results.append({
-                "keyword": keyword,
-                "asin": asin,
-                "title": title,
-                "price_text": price_text,
-                "price": price_number,
-                "url": link
-            })
-
-        except Exception:
-            continue
-
-    results = sorted(results, key=lambda x: x["price"])
-    return results[:limit]
 
 
 def send_search_report(keyword, results):
@@ -464,7 +462,7 @@ def send_search_report(keyword, results):
 def run_search_reports(force=False):
     global last_search_report_key
 
-    now = datetime.now()
+    now = now_tr()
     today = now.date()
     current_hour = now.hour
 
@@ -491,6 +489,8 @@ def run_search_reports(force=False):
     if active_df.empty:
         print("Aktif arama takibi yok.", flush=True)
         return
+
+    tg_send("🔍 Arama takipleri kontrol ediliyor...")
 
     driver = create_driver()
     history_rows = []
@@ -533,6 +533,8 @@ def run_search_reports(force=False):
 
         full_df.to_csv(SEARCH_HISTORY_FILE, index=False)
 
+    tg_send("✅ Arama takipleri tamamlandı.")
+
 
 def run_price_check():
     print("ASIN fiyat kontrolü çalışıyor...", flush=True)
@@ -544,7 +546,7 @@ def run_price_check():
         print("ASIN ürün listesi boş.", flush=True)
         return
 
-    now = datetime.now()
+    now = now_tr()
     today = now.date()
 
     driver = create_driver()
@@ -714,8 +716,7 @@ def handle_callback(callback):
 
     elif data.startswith("days_"):
         days = int(data.replace("days_", ""))
-        user_state = get_state()
-        product_data = user_state.get("data", {})
+        product_data = get_state().get("data", {})
 
         asin = product_data.get("asin")
         url = product_data.get("url")
@@ -745,8 +746,8 @@ def handle_callback(callback):
             "🔎 Takip etmek istediğin ürünü yaz.\n\n"
             "Örnek:\n"
             "DualSense 5\n"
-            "iPhone 15 Pro Max kılıf\n"
-            "AirPods Pro 2"
+            "AirPods Pro 2\n"
+            "LEGO 77256"
         )
 
     elif data == "list_searches":
@@ -762,8 +763,7 @@ def handle_callback(callback):
 
     elif data.startswith("search_days_"):
         days = int(data.replace("search_days_", ""))
-        user_state = get_state()
-        search_data = user_state.get("data", {})
+        search_data = get_state().get("data", {})
         keyword = search_data.get("keyword")
 
         if not keyword:
@@ -790,7 +790,6 @@ def handle_callback(callback):
     elif data == "check_search_now":
         tg_send("🔍 Amazon arama kontrolleri başlatıldı.")
         run_search_reports(force=True)
-        tg_send("✅ Arama kontrolleri tamamlandı.", main_menu())
 
     elif data == "help":
         tg_send(
@@ -809,6 +808,7 @@ def poll_telegram():
     global last_update_id
 
     if not TELEGRAM_TOKEN:
+        print("Telegram token yok.", flush=True)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -838,21 +838,22 @@ def poll_telegram():
 if __name__ == "__main__":
     print("BOT BAŞLADI 🚀", flush=True)
     ensure_files()
+
     tg_send("🚀 Fırsat Radar aktif.\n\nMenüden işlem seçebilirsin:", main_menu())
 
     while True:
         poll_telegram()
 
-        now = time.time()
+        now_time = time.time()
 
-        if now - last_asin_check_time >= ASIN_CHECK_INTERVAL_SECONDS:
+        if now_time - last_asin_check_time >= ASIN_CHECK_INTERVAL_SECONDS:
             try:
                 run_price_check()
             except Exception as e:
                 print(f"ASIN fiyat kontrol hatası: {e}", flush=True)
                 tg_send(f"⚠️ ASIN fiyat kontrol hatası:\n{e}")
 
-            last_asin_check_time = now
+            last_asin_check_time = now_time
 
         try:
             run_search_reports(force=False)
